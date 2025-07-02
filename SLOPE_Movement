@@ -1,0 +1,231 @@
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPSPlus.h>
+#include <SimpleKalmanFilter.h>
+#include <math.h>
+
+// === OLED Setup ===
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// === MPU6050 Setup ===
+Adafruit_MPU6050 mpu;
+sensors_event_t a, g, temp;
+
+// === Kalman Filters ===
+SimpleKalmanFilter kalmanX(0.2, 0.2, 0.01);
+SimpleKalmanFilter kalmanY(0.2, 0.2, 0.01);
+SimpleKalmanFilter kalmanZ(0.2, 0.2, 0.01);
+
+// === GPS ===
+HardwareSerial gpsSerial(1);
+TinyGPSPlus gps;
+
+// === Buttons ===
+#define BUTTON_PIN 33
+
+// === Distance Tracking ===
+float velocityX = 0.0;
+float velocityY = 0.0;
+float posX = 0.0;
+float posY = 0.0;
+
+unsigned long lastUpdateTime = 0;
+
+// === Gravity Baseline ===
+float gravityX = 0.0;
+float gravityY = 0.0;
+float gravityZ = 0.0;
+
+// === Pages ===
+int pageIndex = 0;
+
+// === Start Position ===
+double startLat = 0.0, startLng = 0.0;
+bool startSet = false;
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  Wire.begin();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+
+  if (!mpu.begin()) {
+    display.println("MPU6050 failed!");
+    display.display();
+    while (1);
+  }
+
+  delay(500);
+
+  // Calibrate gravity
+  float sumX = 0, sumY = 0, sumZ = 0;
+  for (int i = 0; i < 100; i++) {
+    mpu.getEvent(&a, &g, &temp);
+    sumX += a.acceleration.x;
+    sumY += a.acceleration.y;
+    sumZ += a.acceleration.z;
+    delay(10);
+  }
+  gravityX = sumX / 100.0;
+  gravityY = sumY / 100.0;
+  gravityZ = sumZ / 100.0;
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Calibration Done");
+  display.display();
+  delay(1000);
+
+  lastUpdateTime = millis();
+}
+
+void loop() {
+  // Button logic
+  static bool lastBtn = HIGH;
+  bool currBtn = digitalRead(BUTTON_PIN);
+  if (lastBtn == HIGH && currBtn == LOW) {
+    pageIndex = (pageIndex + 1) % 3;
+  }
+  lastBtn = currBtn;
+
+  // GPS read
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+
+  // Get IMU
+  mpu.getEvent(&a, &g, &temp);
+
+  float ax = (a.acceleration.x - gravityX) * 9.81;
+  float ay = (a.acceleration.y - gravityY) * 9.81;
+  float az = (a.acceleration.z - gravityZ) * 9.81;
+
+  // Kalman filter
+  ax = kalmanX.updateEstimate(ax);
+  ay = kalmanY.updateEstimate(ay);
+  az = kalmanZ.updateEstimate(az);
+
+  unsigned long now = millis();
+  float dt = (now - lastUpdateTime) / 1000.0;
+  lastUpdateTime = now;
+
+  // Movement logic
+  bool moving = false;
+
+  if (fabs(ax) > 3.0) {
+    velocityX += ax * dt;
+    posX += velocityX * dt;
+    moving = true;
+  }
+  if (fabs(ay) > 3.0) {
+    velocityY += ay * dt;
+    posY += velocityY * dt;
+    moving = true;
+  }
+
+  if (!moving) {
+    velocityX *= 0.9;
+    velocityY *= 0.9;
+  }
+
+  // OLED Display
+  display.clearDisplay();
+  display.setCursor(0, 0);
+
+  if (pageIndex == 0) {
+  display.println("X/Y Distance m");
+  display.printf("X: %.2f\n", posX);
+  display.printf("Y: %.2f\n", posY);
+
+  // === Direction Detection using Velocity Magnitude ===
+  String moveDir = "Stationary";
+  float speed = sqrt(velocityX * velocityX + velocityY * velocityY);
+
+  if (speed > 1.0) {
+    float angle = atan2(velocityY, velocityX) * 180.0 / PI;
+    if (angle < 0) angle += 360;
+
+    if (angle >= 337.5 || angle < 22.5) moveDir = "East";
+    else if (angle >= 22.5 && angle < 67.5) moveDir = "NE";
+    else if (angle >= 67.5 && angle < 112.5) moveDir = "North";
+    else if (angle >= 112.5 && angle < 157.5) moveDir = "NW";
+    else if (angle >= 157.5 && angle < 202.5) moveDir = "West";
+    else if (angle >= 202.5 && angle < 247.5) moveDir = "SW";
+    else if (angle >= 247.5 && angle < 292.5) moveDir = "South";
+    else if (angle >= 292.5 && angle < 337.5) moveDir = "SE";
+  }
+
+  display.print("Dir: ");
+  display.println(moveDir);
+  display.print("Speed: ");
+  display.print(speed, 2);
+  display.println(" m/s");
+}
+
+  else if (pageIndex == 1) {
+    display.println("Acceleration m/s^2");
+    display.printf("X: %.2f\n", ax);
+    display.printf("Y: %.2f\n", ay);
+    display.printf("Z: %.2f\n", az);
+  }
+
+  else if (pageIndex == 2){
+    display.println("GPS Distance/Dir");
+    if (gps.location.isValid()) {
+      double lat = gps.location.lat();
+      double lng = gps.location.lng();
+      if (!startSet) {
+        startLat = lat;
+        startLng = lng;
+        startSet = true;
+      }
+      double dist = calculateDistanceMeters(startLat, startLng, lat, lng);
+      String dir = getDirection(startLat, startLng, lat, lng);
+      display.printf("Dist: %.1f m\n", dist);
+      display.print("Dir: ");
+      display.println(dir);
+    } else {
+      display.println("GPS not fixed");
+    }
+  } 
+  display.display();
+  delay(200);
+}
+
+double calculateDistanceMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0;
+  double dLat = radians(lat2 - lat1);
+  double dLon = radians(lon2 - lon1);
+  double a = sin(dLat / 2) * sin(dLat / 2) +
+             cos(radians(lat1)) * cos(radians(lat2)) * sin(dLon / 2) * sin(dLon / 2);
+  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+String getDirection(double lat1, double lon1, double lat2, double lon2) {
+  double dLat = lat2 - lat1;
+  double dLon = lon2 - lon1;
+  if (fabs(dLat) < 0.0001 && fabs(dLon) < 0.0001) return "Stationary";
+  double angle = atan2(dLat, dLon) * 180.0 / PI;
+  if (angle < 0) angle += 360;
+
+  if (angle >= 337.5 || angle < 22.5) return "East";
+  else if (angle >= 22.5 && angle < 67.5) return "NE";
+  else if (angle >= 67.5 && angle < 112.5) return "North";
+  else if (angle >= 112.5 && angle < 157.5) return "NW";
+  else if (angle >= 157.5 && angle < 202.5) return "West";
+  else if (angle >= 202.5 && angle < 247.5) return "SW";
+  else if (angle >= 247.5 && angle < 292.5) return "South";
+  else return "SE";
+}
