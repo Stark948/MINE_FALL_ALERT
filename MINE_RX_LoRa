@@ -1,0 +1,392 @@
+// code by Adhyayan
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+
+// === OLED Setup ===
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// === LoRa Pins ===
+#define LORA_NSS 4
+#define LORA_RST 5
+#define LORA_DI0 2
+
+#define PAGE_BUTTON_PIN 26
+#define LED_PIN 16
+#define CALIB_BUTTON_PIN 27
+#define BUZZER_PIN 14 
+
+// === WiFi Settings for  HTTP POST ===
+const char* ssid = "add your ssid";
+const char* password = "add your password";
+const char* serverURL = "https://mining-innovation-lab.onrender.com/sensor-data";// server link
+
+// === Timing & State Variables ===
+bool awaitingCalibrationAck = false;
+unsigned long calibrationSendTime = 0;
+unsigned long lastLoRaTime = 0;
+const unsigned long loRaTimeout = 45000;
+const unsigned long fallBeepDuration = 3000;
+bool fallDetected = false;
+unsigned long lastFallAlert = 0;
+
+// === Display Paging ===
+int pageIndex = 0;
+bool lastPageBtn = HIGH;
+unsigned long lastPagePress = 0;
+int pagePressCount = 0;
+const unsigned long dpInterval = 1000;
+
+// === Calibration Button Debounce ===
+bool lastCalibBtn = HIGH;
+unsigned long lastCalibPress = 0;
+const unsigned long calibDebounce = 500;
+
+// === Incoming Sensor Data ===
+String temp, hum, soil, rain, vib, alt, pres;
+String ax, ay, az, gx, gy, gz;
+String heading, dist, dir, speed, mode, fall, lat, lng;
+String timeStr = "N/A";
+String distx, disty, avgdist;
+
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21,22);
+
+  pinMode(PAGE_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(CALIB_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0,0);
+  display.println("Receiver Initializing...");
+  display.display();
+
+  // WiFi (optional for HTTP POST)
+  display.println("WiFi Connecting...");
+  display.display();
+  WiFi.begin(ssid, password);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    display.println("WiFi Connected");
+    digitalWrite(LED_PIN, HIGH);
+  } else {
+    display.println("WiFi Failed");
+  }
+  display.display();
+  delay(1000);
+
+  // Time for timestamps (optional)
+  configTime(0,0,"pool.ntp.org");
+
+  // LoRa init
+  LoRa.setPins(LORA_NSS, LORA_RST, LORA_DI0);
+  if (!LoRa.begin(433E6)) {
+    display.println("LoRa Init Failed");
+    display.display();
+    while (1);
+  }
+  LoRa.setSyncWord(0xF1);
+  display.println("LoRa Ready");
+  display.display();
+  delay(500);
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  if (awaitingCalibrationAck) {
+    display.setTextSize(2);
+    display.setCursor(15, 20);
+    display.println("Calibrating...");
+    display.display();
+    return;
+  }
+
+  if (millis() - lastLoRaTime > loRaTimeout) {
+    display.setTextSize(2);
+    display.setCursor(10, 25);
+    display.println("No LoRa");
+    display.println("Connection");
+    display.display();
+    beepThreeTimes();
+    return;
+  }
+
+  float spd = speed.toFloat();  // Convert speed to float for checks
+
+  switch (pageIndex) {
+    case 0:
+      display.println("Movement Data");
+      display.printf("Mode: %s\n", mode.c_str());
+
+      if (mode == "MPU") {
+        if (spd > 0.02) {
+          display.printf("X: %sm\n", distx.c_str());
+          display.printf("Y: %sm\n", disty.c_str());
+          display.printf("Avg: %sm\n", avgdist.c_str());
+          display.printf("Spd: %sm/s\n", speed.c_str());
+          display.printf("Dir: %s\n", dir.c_str());
+        } else {
+          display.println("X: --");
+          display.println("Y: --");
+          display.println("Avg: --");
+          display.println("Spd: <0.02 m/s");
+          display.println("Dir: --");
+        }
+      } else if (mode == "GPS") {
+        display.printf("Lat: %s\n", lat.c_str());
+        display.printf("Lon: %s\n", lng.c_str());
+        display.printf("Dist: %sm\n", dist.c_str());
+        display.printf("Spd: %sm/s\n", speed.c_str());
+        display.printf("Dir: %s\n", dir.c_str());
+      } else {
+        display.println("Unknown Mode");
+      }
+      break;
+
+    case 1:
+      display.println("Accel & Gyro");
+      display.printf("AX:%6s AY:%6s\n", ax.c_str(), ay.c_str());
+      display.printf("AZ:%6s GX:%6s\n", az.c_str(), gx.c_str());
+      display.printf("GY:%6s GZ:%6s\n", gy.c_str(), gz.c_str());
+      break;
+
+    case 2:
+      display.println("Weather & Soil");
+      display.printf("T:%4sC H:%4s%%\n", temp.c_str(), hum.c_str());
+      display.printf("Soil:%4s%% Rain:%4s%%\n", soil.c_str(), rain.c_str());
+      display.printf("Vib:%3s\n", vib.c_str());
+      display.println("Altitude & Pressure");
+      display.printf("Alt: %sm\nPres: %shPa\n", alt.c_str(), pres.c_str());
+      break;
+
+    case 3:
+      display.println("GPS & Compass");
+      display.printf("Lat:%s\nLng:%s\n", lat.c_str(), lng.c_str());
+      display.printf("Head:%s deg\n", heading.c_str());
+      display.printf("Time:%s\n", timeStr.c_str());
+      break;
+
+    case 4:
+      display.println("Status & Mode");
+      display.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "Lost");
+      display.printf("Mode: %s\n", mode.c_str());
+      display.printf("Fall: %s\n", fallDetected ? "YES" : "No");
+      break;
+  }
+
+  display.display();
+}
+
+
+void loop() {
+  handlePageButton();
+  handleCalibButton();
+
+  int packetSize = LoRa.parsePacket();
+  if (packetSize > 0) {
+    String data = "";
+    while (LoRa.available()) data += (char)LoRa.read();
+    Serial.println("Received: " + data);
+
+    if (data == "ACK:CALIBRATED") {
+      awaitingCalibrationAck = false;
+    } else {
+      parseData(data);
+      lastLoRaTime = millis();
+      digitalWrite(LED_PIN, HIGH);
+      sendSensorData();  // Forward to server
+    }
+
+    // Speed threshold: trigger buzzer if above 0.10 m/s
+    float spd = speed.toFloat();
+    if (spd > 0.10) {
+      tone(BUZZER_PIN, 2000);
+    } else if (!fallDetected) {
+      noTone(BUZZER_PIN);
+    }
+
+    // Fall detection beep for 3s
+    if (fallDetected && millis() - lastFallAlert < fallBeepDuration) {
+      tone(BUZZER_PIN, 1000);
+    } else if (fallDetected && millis() - lastFallAlert >= fallBeepDuration) {
+      fallDetected = false;
+      noTone(BUZZER_PIN);
+    }
+  }
+
+  // LoRa timeout fallback
+  if (millis() - lastLoRaTime > loRaTimeout) {
+    digitalWrite(LED_PIN, LOW);
+    soundAlarm();
+  }
+
+  updateDisplay();
+  delay(50);
+}
+
+void handlePageButton() {
+  bool curr = digitalRead(PAGE_BUTTON_PIN);
+  if (lastPageBtn == HIGH && curr == LOW) {
+    unsigned long now = millis();
+    if (now - lastPagePress < dpInterval) pagePressCount++;
+    else pagePressCount = 1;
+    lastPagePress = now;
+  }
+  lastPageBtn = curr;
+
+  if (pagePressCount > 0 && millis() - lastPagePress > dpInterval) {
+    if (pagePressCount == 1) pageIndex = (pageIndex + 1) % 5;
+    pagePressCount = 0;
+  }
+}
+
+void handleCalibButton() {
+  bool curr = digitalRead(CALIB_BUTTON_PIN);
+  if (lastCalibBtn == HIGH && curr == LOW && millis() - lastCalibPress > calibDebounce) {
+    LoRa.beginPacket();
+    LoRa.print("CMD:CALIBRATE");
+    LoRa.endPacket();
+    awaitingCalibrationAck = true;
+    calibrationSendTime = millis();
+    // Blink LED to indicate action
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("Sent CMD:CALIBRATE");
+    lastCalibPress = millis();
+  }
+  lastCalibBtn = curr;
+}
+
+void parseData(String data) {
+  while (data.indexOf(',') != -1) {
+    String token = data.substring(0, data.indexOf(','));
+    updateValue(token);
+    data = data.substring(data.indexOf(',') + 1);
+  }
+  if (data.length()) updateValue(data);
+}
+
+void updateValue(String tok) {
+  if (tok.startsWith("TEMP:")) temp = tok.substring(5);
+  else if (tok.startsWith("HUM:")) hum = tok.substring(4);
+  else if (tok.startsWith("SOIL:")) soil = tok.substring(5);
+  else if (tok.startsWith("RAIN:")) rain = tok.substring(5);
+  else if (tok.startsWith("VIB:")) vib = (tok.substring(4) == "1") ? "Yes" : "No";
+  else if (tok.startsWith("ALT:")) alt = tok.substring(4);
+  else if (tok.startsWith("PRES:")) pres = tok.substring(5);
+  else if (tok.startsWith("AX:")) ax = tok.substring(3);
+  else if (tok.startsWith("AY:")) ay = tok.substring(3);
+  else if (tok.startsWith("AZ:")) az = tok.substring(3);
+  else if (tok.startsWith("GX:")) gx = tok.substring(3);
+  else if (tok.startsWith("GY:")) gy = tok.substring(3);
+  else if (tok.startsWith("GZ:")) gz = tok.substring(3);
+  else if (tok.startsWith("HEADING:")) heading = tok.substring(8);
+  else if (tok.startsWith("DIST:")) dist = tok.substring(5);
+  else if (tok.startsWith("DISTX:")) distx = tok.substring(6);
+  else if (tok.startsWith("DISTY:")) disty = tok.substring(6);
+  else if (tok.startsWith("AVGDIST:")) avgdist = tok.substring(8);
+  else if (tok.startsWith("DIR:")) dir = tok.substring(4);
+  else if (tok.startsWith("SPEED:")) speed = tok.substring(6);
+  else if (tok.startsWith("MODE:")) mode = tok.substring(5);
+  else if (tok.startsWith("FALL:")) {
+    fall = tok.substring(5);
+    if (fall == "ALERT") {
+      fallDetected = true;
+      lastFallAlert = millis();
+    } else {
+      fallDetected = false;
+    }
+  } else if (tok.startsWith("LAT:")) lat = tok.substring(4);
+  else if (tok.startsWith("LNG:")) lng = tok.substring(4);
+  else if (tok.startsWith("TIME:")) timeStr = tok.substring(5);
+}
+
+
+void soundAlarm() {
+  if (millis() - lastFallAlert < fallBeepDuration) {
+    static int freq = 500;
+    static bool rising = true;
+    static unsigned long toneTime = 0;
+    unsigned long now = millis();
+    if (now - toneTime > 5) {
+      tone(BUZZER_PIN, freq);
+      freq += rising ? 20 : -20;
+      if (freq >= 1000) rising = false;
+      if (freq <= 500) rising = true;
+      toneTime = now;
+    }
+  }
+}
+
+void beepThreeTimes() {
+  for (int i = 0; i < 3; i++) {
+    tone(BUZZER_PIN, 1000);   // Beep at 1000 Hz
+    delay(200);               // Beep duration: 200ms
+    noTone(BUZZER_PIN);       // Stop beep
+    delay(200);               // Pause between beeps: 200ms
+  }
+}
+
+void sendSensorData() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(serverURL);
+  http.addHeader("Content-Type", "application/json");
+
+  String json = "{";
+  json += "\"ax\":\"" + ax + "\",";
+  json += "\"ay\":\"" + ay + "\",";
+  json += "\"az\":\"" + az + "\",";
+  json += "\"gx\":\"" + gx + "\",";
+  json += "\"gy\":\"" + gy + "\",";
+  json += "\"gz\":\"" + gz + "\",";
+  json += "\"temp\":\"" + temp + "\",";
+  json += "\"hum\":\"" + hum + "\",";
+  json += "\"soil\":\"" + soil + "\",";
+  json += "\"rain\":\"" + rain + "\",";
+  json += "\"vbr\":\"" + vib + "\",";
+  json += "\"alt\":\"" + alt + "\",";
+  json += "\"pres\":\"" + pres + "\",";
+  json += "\"lat\":\"" + lat + "\",";
+  json += "\"long\":\"" + lng + "\",";
+  json += "\"heading\":\"" + heading + "\",";
+  json += "\"distx\":\"" + distx + "\",";
+  json += "\"disty\":\"" + disty + "\",";
+  json += "\"avgdist\":\"" + avgdist + "\",";
+  json += "\"speed\":\"" + speed + "\",";
+  json += "\"mode\":\"" + mode + "\",";
+  json += "\"time\":\"" + timeStr + "\",";
+  json += "\"alert\":\"" + fall + "\"";  
+  json += "}";
+
+  int code = http.POST(json);
+  Serial.printf("POST code: %d\n", code);
+  http.end();
+}
+
+
+
+
