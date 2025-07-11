@@ -1,0 +1,575 @@
+// code by Adhyayan.
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include <DHT.h>
+#include <TinyGPSPlus.h>
+#include <Adafruit_BMP085.h>
+#include <Adafruit_HMC5883_U.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <SimpleKalmanFilter.h>
+#include <math.h>
+
+// === WiFi Credentials ===
+const char* ssid = "add your ssid";
+const char* password = "add your password";
+
+// === Web Server ===
+WebServer server(80);
+
+// === OLED Setup ===
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// === Sensor Objects ===
+Adafruit_MPU6050 mpu;
+Adafruit_BMP085 bmp;
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+#define DHTPIN 14
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// === GPS Setup ===
+#define RXD 3
+#define TXD 1
+HardwareSerial gpsSerial(1);
+TinyGPSPlus gps;
+
+// === Pins ===
+#define SOIL_MOISTURE_PIN 26
+#define RAIN_SENSOR_PIN 25
+#define VIBRATION_PIN 27
+#define LED_PIN 13
+#define CALIBRATE_BUTTON_PIN 33
+#define BUZZER_PIN 32
+
+#define EARTH_RADIUS 6371000.0  // in meters
+
+// === LoRa Pins ===
+#define LORA_NSS 4
+#define LORA_RST 5
+#define LORA_DI0 2
+
+// === States ===
+bool fallDetected = false;
+unsigned long lastFallTime = 0;
+const unsigned long fallCooldown = 5000;
+
+String moveDir = "Stationary";
+float speed = 0;
+double startLat = 0.0, startLng = 0.0;
+bool startSet = false;
+bool gpsFixed = false;
+
+// === Buzzer ===
+bool buzzerActive = false;
+unsigned long buzzerStartTime = 0;
+unsigned long lastBuzzerToggle = 0;
+bool buzzerState = false;
+
+// === Kalman Filters for Acceleration ===
+SimpleKalmanFilter kalmanX(0.2, 0.2, 0.01);
+SimpleKalmanFilter kalmanY(0.2, 0.2, 0.01);
+SimpleKalmanFilter kalmanZ(0.2, 0.2, 0.01);
+
+// === Gravity Calibration ===
+float gravityX = 0, gravityY = 0, gravityZ = 0;
+float velocityX = 0, velocityY = 0, posX = 0, posY = 0;
+
+// === Sensor Data ===
+sensors_event_t a, g, mpuTemp;
+float temperature = NAN, humidity = NAN;
+int soilPercent = 0, rainLevel = 0;
+bool vibrationDetected = false;
+float bmpPressure = 0, altitude = 0, groundPressure = 1013.25, baseAltitude = 0;
+float headingDeg = 0;
+
+// === Movement Tracking ===
+
+unsigned long lastUpdateTime = 0;
+
+
+// === Display ===
+int pageIndex = 0;
+bool wifiConnected = false;
+const float Threshold = 0.5;
+
+float currentDistance = 0;
+float currentBearing = 0;
+
+void setup() {
+  Wire.begin(21, 22);
+  Serial.begin(115200);
+  gpsSerial.begin(9600, SERIAL_8N1, RXD, TXD);
+
+  pinMode(VIBRATION_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(CALIBRATE_BUTTON_PIN, INPUT_PULLUP);
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("powered by STARK");
+  display.display();
+
+  if (!mpu.begin()) { display.println("MPU6050 Error"); display.display(); while (1); }
+  if (!bmp.begin()) { display.println("BMP180 Error"); display.display(); while (1); }
+  if (!mag.begin()) { display.println("Mag Error"); display.display(); while (1); }
+  dht.begin();
+
+  display.println("Connecting WiFi...");
+  display.display();
+  WiFi.begin(ssid, password);
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) delay(500);
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  digitalWrite(LED_PIN, wifiConnected ? HIGH : LOW);
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println(wifiConnected ? "WiFi Connected" : "WiFi NOT Connected");
+  if (wifiConnected) {
+    display.print("IP: ");
+    display.println(WiFi.localIP());
+  }
+  display.display();
+  delay(2000);
+
+  LoRa.setPins(LORA_NSS, LORA_RST, LORA_DI0);
+  if (!LoRa.begin(433E6)) {
+    display.println("LoRa Failed");
+    display.display(); while (1);
+  }
+  LoRa.setSyncWord(0xF1);
+  display.println("LoRa Ready");
+  display.display();
+  delay(1000);
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+
+  server.on("/", handleRoot);
+  server.begin();
+
+  calibrateSensors();
+  lastUpdateTime = millis();
+}
+
+void loop() {
+  server.handleClient();
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+
+  updateSensorData();
+  computeMovement();
+  updateOLED();
+  handleLoRa();
+  handleButton();
+  handleBuzzer();
+}
+
+// === Sensor Update ===
+void updateSensorData() {
+  mpu.getEvent(&a, &g, &mpuTemp);
+  speed = sqrt(velocityX * velocityX + velocityY * velocityY);
+  float ax = kalmanX.updateEstimate((a.acceleration.x - gravityX) * 9.81);
+  float ay = kalmanY.updateEstimate((a.acceleration.y - gravityY) * 9.81);
+  float az = kalmanZ.updateEstimate((a.acceleration.z - gravityZ) * 9.81);
+
+  float accMag = sqrt(ax * ax + ay * ay + az * az);
+  if (!buzzerActive && accMag > 3.0) {
+    buzzerActive = true;
+    buzzerStartTime = millis();
+    lastBuzzerToggle = millis();
+    buzzerState = true;
+    digitalWrite(BUZZER_PIN, HIGH);
+    fallDetected = true;
+  }
+
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t)) temperature = t;
+  if (!isnan(h)) humidity = h;
+
+  soilPercent = constrain(map(analogRead(SOIL_MOISTURE_PIN), 3000, 1000, 0, 100), 0, 100);
+  rainLevel = constrain(map(analogRead(RAIN_SENSOR_PIN), 3000, 1000, 0, 100), 0, 100);
+  vibrationDetected = digitalRead(VIBRATION_PIN) == HIGH;
+
+  float p = bmp.readPressure() / 100.0;
+  if (p > 0) bmpPressure = p;
+
+  float currentAltitude = bmp.readAltitude(groundPressure);
+  if (!isnan(currentAltitude)) altitude = currentAltitude - baseAltitude;
+
+  sensors_event_t magEvent;
+  mag.getEvent(&magEvent);
+  float heading = atan2(magEvent.magnetic.y, magEvent.magnetic.x);
+  if (heading < 0) heading += 2 * PI;
+  headingDeg = heading * 180.0 / PI;
+
+  // Distance tracking
+  float dt = (millis() - lastUpdateTime) / 1000.0;
+  lastUpdateTime = millis();
+  bool moving = false;
+  if (fabs(ax) > 3.0) { velocityX += ax * dt; posX += velocityX * dt; moving = true; }
+  if (fabs(ay) > 3.0) { velocityY += ay * dt; posY += velocityY * dt; moving = true; }
+  if (!moving) { velocityX *= 0.9; velocityY *= 0.9; }
+
+    
+  // Compute angle from MPU velocity for dead-reckon bearing
+  if (fabs(velocityX) > 0.1 || fabs(velocityY) > 0.1) {
+    currentBearing = fmod((degrees(atan2(velocityY, velocityX)) + 360), 360);
+    currentDistance = sqrt(posX * posX + posY * posY);
+  }
+}
+
+void handleBuzzer() {
+  if (buzzerActive) {
+    unsigned long now = millis();
+    if (now - lastBuzzerToggle >= 200) {
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+      lastBuzzerToggle = now;
+    }
+    if (now - buzzerStartTime >= 3000) {
+      buzzerActive = false;
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  }
+}
+
+// Determines travel distance & bearing
+void computeMovement() {
+  if (gps.location.isValid()) {
+    double lat = gps.location.lat();
+    double lng = gps.location.lng();
+    if (!startSet) {
+      startLat = lat;
+      startLng = lng;
+      startSet = true;
+    }
+    gpsFixed = true;
+    computeGPSDistanceBearing(lat, lng);
+  } else {
+    gpsFixed = false;
+  }
+}
+
+// Calculates using Haversine & initial GPS fix
+
+void computeGPSDistanceBearing(double lat, double lng) {
+  double dLat = radians(lat - startLat);
+  double dLng = radians(lng - startLng);
+  double a = sin(dLat / 2) * sin(dLat / 2)
+           + cos(radians(startLat)) * cos(radians(lat))
+           * sin(dLng / 2) * sin(dLng / 2);
+  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  currentDistance = EARTH_RADIUS * c;
+
+  double y = sin(dLng) * cos(radians(lat));
+  double x = cos(radians(startLat)) * sin(radians(lat))
+           - sin(radians(startLat)) * cos(radians(lat)) * cos(dLng);
+  currentBearing = fmod((degrees(atan2(y, x)) + 360), 360);
+}
+
+// === OLED Pages ===
+void updateOLED() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+
+  if (pageIndex == 0) {
+  display.println(gpsFixed ? "Mode: GPS" : "Mode: DeadRec");
+  display.printf("Dist: %.2f m\n", currentDistance);
+  display.printf("Bearing: %.1f°\n", currentBearing);
+
+  display.println("X/Y Distance (m):");
+  display.printf("X: %.2f\n", posX);
+  display.printf("Y: %.2f\n", posY);
+
+ 
+  
+
+  if (speed > Threshold) {
+    float angle = atan2(velocityY, velocityX) * 180.0 / PI;
+    if (angle < 0) angle += 360;
+
+    if (angle >= 337.5 || angle < 22.5)       moveDir = "East";
+    else if (angle < 67.5)                    moveDir = "NE";
+    else if (angle < 112.5)                   moveDir = "North";
+    else if (angle < 157.5)                   moveDir = "NW";
+    else if (angle < 202.5)                   moveDir = "West";
+    else if (angle < 247.5)                   moveDir = "SW";
+    else if (angle < 292.5)                   moveDir = "South";
+    else                                      moveDir = "SE";
+  }
+
+  display.printf("Dir: %s\n", moveDir.c_str());
+  display.printf("Speed: %.2f m/s\n", speed);
+}
+
+
+  else if (pageIndex == 1) {
+
+  display.println("Tilt & Accel");
+  float ax = a.acceleration.x - gravityX;
+  float ay = a.acceleration.y - gravityY;
+  float az = a.acceleration.z - gravityZ;
+  display.printf("Ax: %.2f m/s2\n", ax * 9.81);
+  display.printf("Ay: %.2f m/s2\n", ay * 9.81);
+  display.printf("Az: %.2f m/s2\n", az * 9.81);
+  display.printf("Roll: %.1f\n", atan2(ay, az) * 180.0 / PI);
+  display.printf("Pitch: %.1f\n", atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI);
+  display.printf("Yaw: %.1f\n", atan2(az, sqrt(ax * ax + ay * ay)) * 180.0 / PI);
+}
+
+  else if (pageIndex == 2) {
+   display.println("GPS Location");
+    if (gps.location.isValid()) {
+      display.printf("Lat: %.6f\nLng: %.6f\n", gps.location.lat(), gps.location.lng());
+    } else {
+      display.println("GPS: No Fix");
+    }
+    if (gps.time.isValid()) {
+      display.printf("Time: %02d:%02d:%02d\n", gps.time.hour(), gps.time.minute(), gps.time.second());
+    } else {
+      display.println("Time: --:--:--");
+    }
+    display.printf("WiFi: %s\n", wifiConnected ? "Connected" : "Disconnected");
+
+  }
+
+  else if (pageIndex == 3) {
+    display.println("Pressure & Alt");
+    display.printf("Pres: %.1f hPa\n", bmpPressure);
+    display.printf("Alt: %.1f m\n", altitude);
+  }
+
+  else if (pageIndex == 4) {
+    display.println("Env + Vib");
+    display.printf("Temp: %.1f C\nHum: %.1f %%\n", temperature, humidity);
+    display.printf("Soil: %d %%\nRain: %d %%\n", soilPercent, rainLevel);
+    display.printf("Vibration: %s\n", vibrationDetected ? "Yes" : "No");
+  }
+
+  display.display();
+}
+
+void handleButton() {
+  static bool lastBtn = HIGH;
+  bool currBtn = digitalRead(CALIBRATE_BUTTON_PIN);
+  if (lastBtn == HIGH && currBtn == LOW) pageIndex = (pageIndex + 1) % 5;
+  lastBtn = currBtn;
+}
+
+void handleLoRa() {
+  static unsigned long lastLoRaSendTime = 0;
+  if (millis() - lastLoRaSendTime >= 1000) {
+    lastLoRaSendTime = millis();
+
+    String loraMsg = "";
+
+    loraMsg += "TEMP:" + String(temperature) + ",";
+    loraMsg += "HUM:" + String(humidity) + ",";
+    loraMsg += "SOIL:" + String(soilPercent) + ",";
+    loraMsg += "RAIN:" + String(rainLevel) + ",";
+    loraMsg += "VIB:" + String(vibrationDetected ? "1" : "0") + ",";
+    loraMsg += "ALT:" + String(altitude, 1) + ",";
+    loraMsg += "PRES:" + String(bmpPressure) + ",";
+    loraMsg += "AX:" + String(a.acceleration.x, 2) + ",";
+    loraMsg += "AY:" + String(a.acceleration.y, 2) + ",";
+    loraMsg += "AZ:" + String(a.acceleration.z, 2) + ",";
+    loraMsg += "GX:" + String(g.gyro.x, 2) + ",";
+    loraMsg += "GY:" + String(g.gyro.y, 2) + ",";
+    loraMsg += "GZ:" + String(g.gyro.z, 2) + ",";
+    loraMsg += "HEADING:" + String(headingDeg, 1) + ",";
+    loraMsg += "DIST:" + String(currentDistance) + ",";
+    loraMsg += "DIR:" + moveDir + ",";
+    loraMsg += "SPEED:" + String(speed, 2) + ",";
+    loraMsg += "MODE:" + String(gpsFixed ? "GPS" : "MPU") + ",";
+    
+    if (fallDetected) {
+      loraMsg += "FALL:ALERT,";
+    } else {
+      loraMsg += "FALL:0,";
+    }
+    fallDetected = false;
+
+    if (gps.location.isValid()) {
+      loraMsg += "LAT:" + String(gps.location.lat(), 6) + ",";
+      loraMsg += "LNG:" + String(gps.location.lng(), 6);
+    } else {
+      loraMsg += "LAT:N/A,LNG:N/A";
+    }
+
+    if (gps.time.isValid()) {
+      char timeBuffer[16];
+      snprintf(timeBuffer, sizeof(timeBuffer), "%02d:%02d:%02d", 
+               gps.time.hour(), gps.time.minute(), gps.time.second());
+      loraMsg += ",TIME:" + String(timeBuffer);
+    } else {
+      loraMsg += ",TIME:N/A";
+    }
+
+    // Send LoRa packet
+    LoRa.beginPacket();
+    LoRa.print(loraMsg);
+    LoRa.endPacket();
+  }
+}
+
+
+void calibrateSensors() {
+  float sx = 0, sy = 0, sz = 0;
+  for (int i = 0; i < 100; i++) {
+    mpu.getEvent(&a, &g, &mpuTemp);
+    sx += a.acceleration.x;
+    sy += a.acceleration.y;
+    sz += a.acceleration.z;
+    delay(10);
+  }
+  gravityX = sx / 100.0;
+  gravityY = sy / 100.0;
+  gravityZ = sz / 100.0;
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.println("Calibrating...");
+  display.display();
+  delay(500);
+
+  display.println("MPU6050...");
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  display.display();
+  delay(500);
+
+  display.println("Calibrating Pressure...");
+  display.display();
+  groundPressure = calibrateGroundPressure();
+  baseAltitude = bmp.readAltitude(groundPressure); // Store ground reference
+  delay(500);
+
+  display.println("DHT22 Ready");
+  display.display();
+  delay(500);
+
+  display.println("BMP180 Ready");
+  display.display();
+  delay(500);
+
+  display.println("Magnetometer OK");
+  display.display();
+  delay(500);
+
+  display.println("Analog Sensors OK");
+  display.display();
+  delay(500);
+
+  display.println("Vibration OK");
+  display.display();
+  delay(500);
+
+  display.println("Calibration Done");
+  display.display();
+  delay(1500);
+
+  LoRa.beginPacket();
+  LoRa.print("ACK:CALIBRATED");
+  LoRa.endPacket();
+}
+
+float calibrateGroundPressure() {
+  float total = 0;
+  int samples = 10;
+  for (int i = 0; i < samples; i++) {
+    float p = bmp.readPressure();
+    if (p <= 0) { i--; delay(100); continue; }
+    total += p;
+    delay(100);
+  }
+  return total / samples / 100.0;
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<meta http-equiv='refresh' content='5'>";
+  html += "<title>ESP32 Sensor Dashboard</title></head><body>";
+  html += "<h2>ESP32 Sensor Readings</h2><ul>";
+
+  // === Basic Environmental Data ===
+  html += "<li><b>DHT Temp:</b> " + String(temperature) + " °C</li>";
+  html += "<li><b>Humidity:</b> " + String(humidity) + " %</li>";
+  html += "<li><b>Soil Moisture:</b> " + String(soilPercent) + " %</li>";
+  html += "<li><b>Soil Raw Analog:</b> " + String(analogRead(SOIL_MOISTURE_PIN)) + "</li>";  // NEW LINE
+  html += "<li><b>Rain Level:</b> " + String(rainLevel) + " %</li>";
+  html += "<li><b>Rain Raw Analog:</b> " + String(analogRead(RAIN_SENSOR_PIN)) + "</li>";    // NEW LINE
+  html += "<li><b>Vibration:</b> " + String(vibrationDetected ? "Detected" : "None") + "</li>";
+  html += "<li><b>Altitude (Rel):</b> " + String(altitude, 1) + " m</li>";
+  html += "<li><b>Pressure:</b> " + String(bmpPressure) + " hPa</li>";
+
+  // === GPS and Position Data ===
+  html += "<li><b>Mode:</b> " + String(gpsFixed ? "GPS" : "Dead Reckoning") + "</li>";
+  html += "<li><b>Distance from Origin:</b> " + String(currentDistance, 2) + " m</li>";
+  html += "<li><b>Bearing:</b> " + String(currentBearing, 1) + "°</li>";
+  html += "<li><b>GPS Lat:</b> " + (gps.location.isValid() ? String(gps.location.lat(), 6) : "N/A") + "</li>";
+  html += "<li><b>GPS Lng:</b> " + (gps.location.isValid() ? String(gps.location.lng(), 6) : "N/A") + "</li>";
+
+  // === Motion ===
+  speed = sqrt(velocityX * velocityX + velocityY * velocityY);
+  html += "<li><b>Speed:</b> " + String(speed, 2) + " m/s</li>";
+  html += "<li><b>Velocity X:</b> " + String(velocityX, 2) + " m/s</li>";
+  html += "<li><b>Velocity Y:</b> " + String(velocityY, 2) + " m/s</li>";
+  html += "<li><b>Position X:</b> " + String(posX, 2) + " m</li>";
+  html += "<li><b>Position Y:</b> " + String(posY, 2) + " m</li>";
+
+  // === Direction ===
+
+  float angle = atan2(velocityY, velocityX) * 180.0 / PI;
+  if (angle < 0) angle += 360;
+  if (speed > Threshold) {
+    if (angle >= 337.5 || angle < 22.5) moveDir = "East";
+    else if (angle < 67.5) moveDir = "NE";
+    else if (angle < 112.5) moveDir = "North";
+    else if (angle < 157.5) moveDir = "NW";
+    else if (angle < 202.5) moveDir = "West";
+    else if (angle < 247.5) moveDir = "SW";
+    else if (angle < 292.5) moveDir = "South";
+    else moveDir = "SE";
+  }
+  html += "<li><b>Direction:</b> " + moveDir + "</li>";
+
+  // === Acceleration ===
+  float ax = (a.acceleration.x - gravityX) * 9.81;
+  float ay = (a.acceleration.y - gravityY) * 9.81;
+  float az = (a.acceleration.z - gravityZ) * 9.81;
+  html += "<li><b>Accel X:</b> " + String(ax, 2) + " m/s²</li>";
+  html += "<li><b>Accel Y:</b> " + String(ay, 2) + " m/s²</li>";
+  html += "<li><b>Accel Z:</b> " + String(az, 2) + " m/s²</li>";
+
+  // === Orientation ===
+  html += "<li><b>Heading:</b> " + String(headingDeg, 1) + "°</li>";
+
+  // === System ===
+  html += "<li><b>WiFi:</b> " + String(wifiConnected ? "Connected" : "Disconnected") + "</li>";
+  html += "<li><b>Fall Detected:</b> " + String(fallDetected ? "YES" : "NO") + "</li>";
+
+  html += "</ul></body></html>";
+  server.send(200, "text/html", html);
+  fallDetected = false;
+}
+
+
